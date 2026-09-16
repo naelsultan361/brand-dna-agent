@@ -17,8 +17,8 @@ conversation. Every member adds a few of their own texts; the agent distills
 one **Voice Contract** per person and merges them into a shared, versioned
 **Team Contract**. From then on every text written through the agent is scored
 by a **Critic** against that contract before anyone sees it. Below the
-threshold the task gets a second attempt with the critic's findings, on a
-larger model if one is configured. Nothing ships unscored.
+threshold the task gets a second attempt with the critic's findings on Flower's
+Endeavor model. Nothing ships unscored.
 
 ## Commands
 
@@ -63,8 +63,9 @@ show
 ```
 
 Configuration lives in `pyproject.toml` under `[tool.flwr.app.config.agent]`:
-`model`, `escalation-model` (used for the second attempt), `threshold`
-(default 0.8) and `max-tool-turns` (bound for `web_fetch`, default 2).
+`model` (default `openai/gpt-5.6-sol`), `escalation-model` (the second attempt
+runs on Flower's `flower-endeavor-v1.0`), `threshold` (default 0.8) and
+`max-tool-turns` (bound for `web_fetch`, default 2).
 
 ## Run locally with Ollama
 
