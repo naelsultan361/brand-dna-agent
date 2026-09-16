@@ -184,26 +184,20 @@ def render_contract(team: dict, version: str, voices: list[dict], accepted: int,
     return out
 
 
-def fetch_text(
-    client: OpenAI, agent: AgentSession, model: str, url: str, max_turns: int
-) -> str:
-    """Read a public page through Flower's web_fetch connector (bounded loop)."""
+def distill_from_url(
+    client: OpenAI, agent: AgentSession, model: str, name: str, url: str, max_turns: int
+) -> tuple[dict, int]:
+    """Read a public page through Flower's web_fetch connector and distill the
+    author's voice directly from it (style analysis, never reproduction).
+    Returns the contract and the approximate word count of the fetched page."""
     tools = agent.connectors.tools(["web_fetch"])
     allowed = {t["name"] for t in tools if isinstance(t.get("name"), str)}
     items: list[dict[str, Any]] = [
-        {
-            "type": "message",
-            "role": "user",
-            "content": (
-                f"Fetch {url} and return only the author's own prose from that page "
-                "as plain text. Drop navigation, boilerplate, comments by others."
-            ),
-        }
+        {"type": "message", "role": "user", "content": f"Fetch {url} so we can analyse the author's writing style."}
     ]
+    fetched_words = 0
     for _ in range(max_turns):
-        response = client.responses.create(
-            model=model, input=items, tools=tools, tool_choice="auto"
-        )
+        response = client.responses.create(model=model, input=items, tools=tools, tool_choice="auto")
         output = [item.to_dict() for item in response.output]
         calls = [i for i in output if i.get("type") == "function_call"]
         if not calls:
@@ -211,26 +205,35 @@ def fetch_text(
         outputs = []
         for call in calls:
             if call.get("name") not in allowed:
-                outputs.append(
-                    {"type": "function_call_output", "call_id": call["call_id"],
-                     "output": json.dumps({"error": "tool not exposed"})}
-                )
+                outputs.append({"type": "function_call_output", "call_id": call["call_id"],
+                                "output": json.dumps({"error": "tool not exposed"})})
                 continue
             try:
-                outputs.append(agent.connectors.call(call))
+                result = agent.connectors.call(call)
+                fetched_words += len(str(result.get("output", "")).split())
+                outputs.append(result)
             except (RuntimeError, ValueError) as exc:
-                outputs.append(
-                    {"type": "function_call_output", "call_id": call["call_id"],
-                     "output": json.dumps({"error": str(exc)})}
-                )
+                outputs.append({"type": "function_call_output", "call_id": call["call_id"],
+                                "output": json.dumps({"error": str(exc)})})
         items.extend(output)
         items.extend(outputs)
-    final = client.responses.create(
-        model=model,
-        input=items,
-        instructions="Return only the author's prose from the fetched page as plain text.",
-    )
-    return final.output_text.strip()
+    if fetched_words < 40:
+        raise ValueError(f"the page yielded only {fetched_words} words of text")
+    items.append({
+        "type": "message", "role": "user",
+        "content": (
+            "You are a voice analyst. Using ONLY the author's own prose on the fetched page "
+            "(ignore navigation, boilerplate, comments by others), distill a Voice Contract: "
+            "a compact, machine-readable description of HOW this person writes. This is a style "
+            "analysis, do not reproduce or quote more than a few words at a time. Spelling "
+            "conventions are not style. Describe only what the text shows, invent nothing. "
+            f"Answer with one JSON object exactly in this shape:\n{json.dumps(CONTRACT_SCHEMA, ensure_ascii=False, indent=2)}\n\n"
+            f"AUTHOR: {name}"
+        ),
+    })
+    agent.events.emit({"type": "brand_dna.stage", "stage": "reader-url", "model": model})
+    final = client.responses.create(model=model, input=items)
+    return json_block(final.output_text), fetched_words
 
 
 # ---------------------------------------------------------------- stages ---
@@ -444,20 +447,20 @@ def _main(agent: AgentSession, context: Context) -> None:
     if command == "add-voice":
         source = "url" if URL_RE.match(payload) else "text"
         if source == "url":
-            say(agent, f"Reading {payload} through `web_fetch` …\n\n")
+            say(agent, f"Reading {payload} through `web_fetch` and distilling **{name}**'s voice …\n\n")
             try:
-                text = fetch_text(client, agent, model, payload, max_turns)
-            except Exception as exc:  # connector unavailable in this runtime
-                say(agent, f"Could not read the URL here ({exc}). Paste the text instead.\n")
+                contract, words = distill_from_url(client, agent, model, name, payload, max_turns)
+            except Exception as exc:  # connector unavailable or page without prose
+                say(agent, f"Could not read a voice from that URL ({exc}). Paste the text instead.\n")
                 return
+            voice = {"name": name, "contract": contract, "words": words}
         else:
             text = payload
-        if len(text.split()) < 15:
-            say(agent, "That is too little text to read a voice from. Give me at least a few sentences.\n")
-            return
-
-        say(agent, f"Distilling **{name}**'s voice from {len(text.split())} words …\n\n")
-        voice = distill_voice(client, agent, model, name, text)
+            if len(text.split()) < 15:
+                say(agent, "That is too little text to read a voice from. Give me at least a few sentences.\n")
+                return
+            say(agent, f"Distilling **{name}**'s voice from {len(text.split())} words …\n\n")
+            voice = distill_voice(client, agent, model, name, text)
         voice["source"] = source
         state["voices"] = [v for v in state["voices"] if v["name"].lower() != name.lower()] + [voice]
         state["team"] = merge_team(client, agent, model, state["voices"])

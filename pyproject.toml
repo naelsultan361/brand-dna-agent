@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "brand-dna-agent"
-version = "0.1.5"
+version = "0.1.6"
 description = "Team Voice: a collaborative Flower AgentApp that distills a shared, versioned voice contract from each member's texts and checks every generated text against it"
 license = { file = "LICENSE" }
 requires-python = ">=3.11,<4.0"
