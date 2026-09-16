@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brand-dna-agent"
+version = "0.1.0"
+description = "Team Voice: a collaborative Flower AgentApp that distills a shared, versioned voice contract from each member's texts and checks every generated text against it"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<4.0"
+dependencies = ["flwr>=1.37.0,<2.0", "openai>=2.16.0,<3.0.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent"]
+
+[tool.flwr.app]
+publisher = "sultan361"
+display-name = "Brand-DNA Agent"
+fab-format-version = 1
+flwr-version-target = "1.37.0"
+fab-include = ["agent/**/*.py", "LICENSE"]
+
+[tool.flwr.app.config.agent]
+# Chat input. Commands: "add-voice <name>: <text or URL>", "write: <task>", "show", "help".
+input = "help"
+# Runtime model. SuperGrid: openai/gpt-5.6-sol. Local Ollama via --run-config 'agent.model="gemma4:latest"'.
+model = "openai/gpt-5.6-sol"
+# Larger model the writer escalates to when the critic score stays below the threshold.
+escalation-model = "openai/gpt-5.6-sol"
+threshold = 0.8
+# Bound for the web_fetch tool loop when a voice sample is given as URL.
+max-tool-turns = 2
+
+[tool.flwr.app.components]
+agentapp = "agent.agent_app:app"
