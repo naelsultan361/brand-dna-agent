@@ -392,6 +392,9 @@ def parse_command(prompt: str, has_team: bool) -> tuple[str, str, str]:
 
 @app.main()
 def main(agent: AgentSession, context: Context) -> None:
+    # Open the chat turn like a real model stream would, so the browser renders our text live.
+    agent.events.emit({"type": "response.created"})
+    agent.events.emit({"type": "response.in_progress"})
     try:
         _main(agent, context)
     except Exception as exc:  # surface the failure in the chat, then fail the run
