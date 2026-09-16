@@ -319,7 +319,10 @@ def main(agent: AgentSession, context: Context) -> None:
         _main(agent, context)
     except Exception as exc:  # surface the failure in the chat, then fail the run
         say(agent, f"\n\n**Run failed:** {exc}\n")
+        agent.events.emit({"type": "error", "error": {"message": str(exc)}})
         raise
+    # Our own markdown has no model stream behind it, so close the chat turn explicitly.
+    agent.events.emit({"type": "response.completed"})
 
 
 def _main(agent: AgentSession, context: Context) -> None:
