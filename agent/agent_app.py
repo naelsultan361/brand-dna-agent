@@ -298,7 +298,7 @@ def write_and_check(
 ) -> dict:
     contract_json = json.dumps(team, ensure_ascii=False, indent=2)
 
-    say(agent, "### Generic model (no contract)\n\n")
+    say(agent, f"**Task:** {task}\n\n### Generic model (no contract)\n\n")
     baseline = ask(client, agent, model, "baseline", task, show=True)
 
     attempts: list[dict] = []
@@ -382,6 +382,8 @@ def parse_command(prompt: str, has_team: bool) -> tuple[str, str, str]:
     m = re.match(r"^add[- _]?voice\s+([^:]+?)\s*:\s*(.+)$", text, flags=re.S | re.I)
     if m:
         return "add-voice", m.group(1).strip(), m.group(2).strip()
+    if re.match(r"^write\s*:?\s*$", text, flags=re.I):
+        return "write", "", ""  # bare command, no task
     m = re.match(r"^write\s*:\s*(.+)$", text, flags=re.S | re.I)
     if m:
         return "write", "", m.group(1).strip()
@@ -474,6 +476,9 @@ def _main(agent: AgentSession, context: Context) -> None:
         return
 
     # command == "write"
+    if not payload:
+        say(agent, "Tell me what to write, for example: `write: Announce to our users in three sentences that the login bug is fixed.`\n")
+        return
     if state["team"] is None:
         say(agent, "No Team Contract yet. Add a voice first: `add-voice <name>: <text>`\n")
         return
