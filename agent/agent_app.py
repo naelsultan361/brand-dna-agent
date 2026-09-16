@@ -230,14 +230,20 @@ def write_and_check(
     baseline = ask(client, agent, model, "baseline", task, show=True)
 
     attempts: list[dict] = []
+    feedback = ""
     for attempt, gen_model in enumerate((model, escalation_model), start=1):
-        label = "Brand-DNA Agent" if attempt == 1 else f"Brand-DNA Agent · escalated to `{gen_model}`"
+        if attempt == 1:
+            label = "Brand-DNA Agent"
+        elif gen_model != model:
+            label = f"Brand-DNA Agent · escalated to `{gen_model}`"
+        else:
+            label = "Brand-DNA Agent · revised with critic feedback"
         say(agent, f"\n\n### {label} · Team Contract v{version}\n\n")
         draft = ask(
             client, agent, gen_model, f"generator-{attempt}",
             "Write the following task strictly in the team's voice as defined by the "
             "Team Contract. Respect every taboo. Use the contract's language. Output only "
-            f"the text, no preamble.\n\nTEAM CONTRACT:\n{contract_json}\n\nTASK:\n{task}",
+            f"the text, no preamble.\n\nTEAM CONTRACT:\n{contract_json}\n\nTASK:\n{task}{feedback}",
             show=True,
         )
         verdict_raw = ask(
@@ -251,13 +257,15 @@ def write_and_check(
         )
         verdict = json_block(verdict_raw)
         score = float(verdict.get("score", 0.0))
+        violations = [str(v) for v in verdict.get("violations", [])]
         attempts.append({"model": gen_model, "score": score, "verdict": verdict, "text": draft})
         agent.events.emit({"type": "brand_dna.critic", "attempt": attempt, "model": gen_model, "score": score})
         say(agent, f"\n\n**Critic:** {score:.2f} / threshold {threshold:.2f} · {verdict.get('verdict', '')}\n")
-        if score >= threshold or gen_model == escalation_model:
+        if score >= threshold or attempt == 2:
             break
         agent.events.emit({"type": "brand_dna.escalation", "from": model, "to": escalation_model, "score": score})
-        say(agent, f"\n_Below threshold. Escalating to `{escalation_model}`._\n")
+        say(agent, f"\n_Below threshold. {'Escalating to `' + escalation_model + '`' if escalation_model != model else 'Revising'} with the critic's findings._\n")
+        feedback = "\n\nA previous draft failed the critic. Fix these violations: " + "; ".join(violations)
 
     best = max(attempts, key=lambda a: a["score"])
     violations = best["verdict"].get("violations", [])
@@ -405,6 +413,6 @@ def _main(agent: AgentSession, context: Context) -> None:
         save_state(context, state)
         say(agent, f"\n_Accepted. Team Contract → v{state['version']}._\n")
     else:
-        say(agent, "\n_Not accepted: below threshold even after escalation. Nothing ships unscored._\n")
+        say(agent, "\n_Not accepted: still below threshold after the second attempt. Nothing ships unscored._\n")
     agent.events.emit({"type": "brand_dna.result", "version": state["version"], **{k: v for k, v in result.items() if k != "baseline"}})
     print(json.dumps({"score": result["score"], "passed": result["passed"], "escalated": result["escalated"], "version": state["version"]}))
