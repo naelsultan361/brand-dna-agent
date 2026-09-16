@@ -129,6 +129,60 @@ def json_block(text: str) -> dict[str, Any]:
     return json.loads(match.group(0))
 
 
+# ---------------------------------------------------------------- render ---
+
+
+def pills(items: Any) -> str:
+    """Render a list as inline-code pills: `a` `b` `c`."""
+    if isinstance(items, str):
+        items = [items]
+    words = [str(i).strip() for i in (items or []) if str(i).strip()]
+    return " ".join(f"`{w}`" for w in words) or "_none found_"
+
+
+def field(label: str, value: Any) -> str:
+    text = str(value or "").strip()
+    return f"**{label}:** {text}\n\n" if text else ""
+
+
+def render_voice(name: str, contract: dict) -> str:
+    """One member's Voice Contract as a readable card."""
+    return (
+        f"### Voice of {name}\n\n"
+        + field("Tone", contract.get("tone"))
+        + field("Register", contract.get("register"))
+        + field("Rhythm", contract.get("sentence_rhythm"))
+        + field("Openings and closings", contract.get("openings_closings"))
+        + f"**Vocabulary:** {pills(contract.get('vocabulary'))}\n\n"
+        + f"**Taboos:** {pills(contract.get('taboos'))}\n\n"
+    )
+
+
+def render_contract(team: dict, version: str, voices: list[dict], accepted: int) -> str:
+    """The Team Contract as a readable card, machine-readable JSON below it."""
+    members = ", ".join(v["name"] for v in voices) or ", ".join(team.get("members", []))
+    out = (
+        f"## Team Contract v{version}\n\n"
+        f"**Members:** {members} · **Accepted texts:** {accepted}\n\n"
+        + field("Tone", team.get("tone"))
+        + field("Register", team.get("register"))
+        + field("Rhythm", team.get("sentence_rhythm"))
+        + field("Openings and closings", team.get("openings_closings"))
+        + f"**Vocabulary:** {pills(team.get('vocabulary'))}\n\n"
+        + f"**Taboos:** {pills(team.get('taboos'))}\n\n"
+    )
+    notes = team.get("individual_notes") or {}
+    if isinstance(notes, dict) and notes:
+        out += "**Individual notes:**\n\n" + "".join(
+            f"- **{who}:** {str(note).strip()}\n" for who, note in notes.items()
+        ) + "\n"
+    out += (
+        "_machine-readable contract_\n\n"
+        f"```json\n{json.dumps(team, ensure_ascii=False, indent=2)}\n```\n"
+    )
+    return out
+
+
 def fetch_text(
     client: OpenAI, agent: AgentSession, model: str, url: str, max_turns: int
 ) -> str:
@@ -186,7 +240,9 @@ def distill_voice(client: OpenAI, agent: AgentSession, model: str, name: str, te
         client, agent, model, "reader",
         "You are a voice analyst. Read the author's own text below and distill a "
         "Voice Contract: a compact, machine-readable description of how this person "
-        "writes. Describe only what the text shows, invent nothing. Answer with one "
+        "writes. Describe only what the text shows, invent nothing. Spelling conventions "
+        "such as ae/ue/oe instead of umlauts or a missing sharp s come from the input device, "
+        "so treat them neither as a taboo nor as a style trait. Answer with one "
         f"JSON object exactly in this shape:\n{json.dumps(CONTRACT_SCHEMA, ensure_ascii=False, indent=2)}\n\n"
         f"AUTHOR: {name}\nTEXT:\n{text}",
         show=False,
@@ -204,7 +260,7 @@ def merge_team(client: OpenAI, agent: AgentSession, model: str, voices: list[dic
     raw = ask(
         client, agent, model, "team",
         "You are a voice analyst for a team. Below are Voice Contracts of several team "
-        "members. Derive ONE Team Contract in the same JSON shape that captures what "
+        "members. Derive ONE Team Contract with exactly the top-level keys of SHAPE (no wrapper object) that captures what "
         "they share, so that any member can write for the team and it still sounds like "
         "the team. Add a field \"individual_notes\": an object mapping member name to one "
         "sentence with that person's distinctive deviation. Add \"members\": list of names. "
@@ -215,8 +271,23 @@ def merge_team(client: OpenAI, agent: AgentSession, model: str, voices: list[dic
         ),
         show=False,
     )
-    team = json_block(raw)
+    team = flatten_contract(json_block(raw))
     team.setdefault("members", [v["name"] for v in voices])
+    return team
+
+
+def flatten_contract(team: dict) -> dict:
+    """Hoist the contract fields to the top level if the model nested them
+    (e.g. under "team_contract"); keeps members and individual_notes."""
+    if "tone" in team:
+        return team
+    for key, value in list(team.items()):
+        if isinstance(value, dict) and "tone" in value:
+            flat = dict(value)
+            for extra in ("members", "individual_notes"):
+                if extra in team:
+                    flat.setdefault(extra, team[extra])
+            return flat
     return team
 
 
@@ -250,7 +321,9 @@ def write_and_check(
             client, agent, model, f"critic-{attempt}",
             "You are a strict critic. Score how well the DRAFT follows the TEAM CONTRACT "
             "from 0.0 (generic model voice) to 1.0 (indistinguishable from the team). "
-            "Punish every taboo violation and every generic phrase. Answer with one JSON "
+            "Punish every taboo violation and every generic phrase. Leave the spelling of "
+            "umlauts and sharp s out of the score; that comes from the keyboard, not the voice. "
+            "Answer with one JSON "
             'object: {"score": <number>, "violations": [<short strings>], "verdict": "<one sentence>"}'
             f"\n\nTEAM CONTRACT:\n{contract_json}\n\nDRAFT:\n{draft}",
             show=False,
@@ -260,7 +333,8 @@ def write_and_check(
         violations = [str(v) for v in verdict.get("violations", [])]
         attempts.append({"model": gen_model, "score": score, "verdict": verdict, "text": draft})
         agent.events.emit({"type": "brand_dna.critic", "attempt": attempt, "model": gen_model, "score": score})
-        say(agent, f"\n\n**Critic:** {score:.2f} / threshold {threshold:.2f} · {verdict.get('verdict', '')}\n")
+        mark = "✅" if score >= threshold else "❌"
+        say(agent, f"\n\n**Critic:** {score:.2f} / {threshold:.2f} {mark}\n\n_{verdict.get('verdict', '')}_\n")
         if score >= threshold or attempt == 2:
             break
         agent.events.emit({"type": "brand_dna.escalation", "from": model, "to": escalation_model, "score": score})
@@ -270,7 +344,7 @@ def write_and_check(
     best = max(attempts, key=lambda a: a["score"])
     violations = best["verdict"].get("violations", [])
     if violations:
-        say(agent, "\n**Remaining violations:** " + "; ".join(map(str, violations)) + "\n")
+        say(agent, "\n**Remaining violations:**\n\n" + "".join(f"- {v}\n" for v in map(str, violations)))
     return {
         "baseline": baseline,
         "text": best["text"],
@@ -290,7 +364,9 @@ HELP = (
     "- `add-voice <name>: <text or public URL>` distills that person's voice and updates the Team Contract\n"
     "- `write: <task>` writes under the Team Contract; a critic scores it before you see it\n"
     "- `show` prints the current Team Contract, members and version\n\n"
-    "Start with `add-voice` for each team member, then `write:`.\n"
+    "Start with `add-voice` for each team member, then `write:`. Once a Team Contract exists, "
+    "free text counts as `write:`.\n\n"
+    "The agent stores contracts only; your original texts are read once and then discarded.\n"
 )
 
 
@@ -354,12 +430,7 @@ def _main(agent: AgentSession, context: Context) -> None:
         if state["team"] is None:
             say(agent, "No Team Contract yet. Add a voice first: `add-voice <name>: <text>`\n")
             return
-        members = ", ".join(v["name"] for v in state["voices"])
-        out = (
-            f"## Team Contract v{state['version']}\n\n"
-            f"**Members:** {members} · **Accepted texts:** {state['accepted']}\n\n"
-            f"```json\n{json.dumps(state['team'], ensure_ascii=False, indent=2)}\n```\n"
-        )
+        out = render_contract(state["team"], state["version"], state["voices"], state["accepted"])
         say(agent, out)
         print(out)
         return
@@ -388,16 +459,10 @@ def _main(agent: AgentSession, context: Context) -> None:
         save_state(context, state)
         agent.events.emit({"type": "brand_dna.contract", "version": state["version"], "members": [v["name"] for v in state["voices"]]})
 
-        c = voice["contract"]
         out = (
-            f"### Voice of {name}\n\n"
-            f"- **Tone:** {c.get('tone', '')}\n"
-            f"- **Rhythm:** {c.get('sentence_rhythm', '')}\n"
-            f"- **Taboos:** {', '.join(map(str, c.get('taboos', []))) or 'none found'}\n\n"
-            f"### Team Contract → v{state['version']}\n\n"
-            f"**Members:** {', '.join(v['name'] for v in state['voices'])}\n\n"
-            f"```json\n{json.dumps(state['team'], ensure_ascii=False, indent=2)}\n```\n"
-            "_Stored: the contract. Discarded: the original text._\n"
+            render_voice(name, voice["contract"])
+            + render_contract(state["team"], state["version"], state["voices"], state["accepted"])
+            + "\n_Stored: the contract. Discarded: the original text._\n"
         )
         say(agent, out)
         print(out)
