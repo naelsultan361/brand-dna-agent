@@ -158,8 +158,8 @@ def render_voice(name: str, contract: dict) -> str:
     )
 
 
-def render_contract(team: dict, version: str, voices: list[dict], accepted: int) -> str:
-    """The Team Contract as a readable card, machine-readable JSON below it."""
+def render_contract(team: dict, version: str, voices: list[dict], accepted: int, *, with_json: bool = True) -> str:
+    """The Team Contract as a readable card, machine-readable JSON below it on request."""
     members = ", ".join(v["name"] for v in voices) or ", ".join(team.get("members", []))
     out = (
         f"## Team Contract v{version}\n\n"
@@ -176,10 +176,11 @@ def render_contract(team: dict, version: str, voices: list[dict], accepted: int)
         out += "**Individual notes:**\n\n" + "".join(
             f"- **{who}:** {str(note).strip()}\n" for who, note in notes.items()
         ) + "\n"
-    out += (
-        "_machine-readable contract_\n\n"
-        f"```json\n{json.dumps(team, ensure_ascii=False, indent=2)}\n```\n"
-    )
+    if with_json:
+        out += (
+            "_machine-readable contract_\n\n"
+            f"```json\n{json.dumps(team, ensure_ascii=False, indent=2)}\n```\n"
+        )
     return out
 
 
@@ -459,11 +460,12 @@ def _main(agent: AgentSession, context: Context) -> None:
         save_state(context, state)
         agent.events.emit({"type": "brand_dna.contract", "version": state["version"], "members": [v["name"] for v in state["voices"]]})
 
-        out = (
-            render_voice(name, voice["contract"])
-            + render_contract(state["team"], state["version"], state["voices"], state["accepted"])
-            + "\n_Stored: the contract. Discarded: the original text._\n"
-        )
+        out = render_voice(name, voice["contract"])
+        if len(state["voices"]) == 1:
+            out += f"## Team Contract v{state['version']}\n\nStarts as {name}'s voice. Add more members and the contract becomes the team's.\n\n"
+        else:
+            out += render_contract(state["team"], state["version"], state["voices"], state["accepted"], with_json=False)
+        out += "\n_Stored: the contract. Discarded: the original text. `show` prints the full contract._\n"
         say(agent, out)
         print(out)
         return
