@@ -1,28 +1,42 @@
-"""Brand-DNA Agent: a Flower AgentApp that keeps generated text in the user's voice.
+"""Brand-DNA Agent / Team Voice: a collaborative Flower AgentApp.
 
-Four stages, mirroring the pitch schema:
-  01 INPUT      three sample texts from the run config
-  02 EXTRACTOR  voice features from the samples
-  03 READER     a versioned Voice Contract (JSON), gate 1
-  04 GENERATOR  writes the task under the contract
-  05 CRITIC     scores the draft against the contract, gate 2;
-                below threshold the task escalates to a larger model
-The baseline (generic model output without a contract) is produced as well so a
-frontend can show both side by side.
+A team shares this agent in one conversation (run series). Every member adds
+their own texts; the agent distills one Voice Contract per person and a shared,
+versioned Team Contract. From then on every text written through the agent is
+scored against the Team Contract by a critic before it reaches the user; if the
+score stays below the threshold the task escalates once to a larger model.
+
+Commands (sent as the chat prompt / `agent.input`):
+  add-voice <name>: <text or public URL>   distill a voice, update the team contract
+  write: <task>                            write under the team contract, scored
+  show                                     current team contract, members, version
+  help                                     this list
+Free text with an existing team contract is treated as `write:`.
+
+Safety: contracts are built only from texts the user supplies (or a URL the user
+names, read through Flower's `web_fetch` connector); the conversation state keeps
+contracts, never the original texts; every loop is bounded; the critic fails
+closed.
 """
+
+from __future__ import annotations
 
 import json
 import os
 import re
+from typing import Any
 
 from flwr.agentapp import AgentApp, AgentSession
-from flwr.app import Context
+from flwr.app import ConfigRecord, Context
 from openai import OpenAI
 
 app = AgentApp()
 
+STATE_KEY = "team_voice"
+MAX_TOOL_TURNS_LIMIT = 5
+URL_RE = re.compile(r"^https?://\S+$")
+
 CONTRACT_SCHEMA = {
-    "version": "1.0",
     "tone": "how the author sounds (e.g. direct, warm, dry)",
     "register": "du/Sie, formal/informal, first person usage",
     "sentence_rhythm": "typical length, active/passive, how sentences open",
@@ -33,47 +47,284 @@ CONTRACT_SCHEMA = {
 }
 
 
-def _cfg(context: Context, key: str, default=None):
+# ---------------------------------------------------------------- state ----
+
+
+def load_state(context: Context) -> dict[str, Any]:
+    """Read the shared team state from the run series (empty on first run)."""
+    record = context.state.config_records.get(STATE_KEY)
+    if record is None:
+        return {"voices": [], "team": None, "version": "0.0", "accepted": 0}
+    voices = [json.loads(v) for v in record.get("voices", [])]
+    team_raw = record.get("team", "")
+    return {
+        "voices": voices,
+        "team": json.loads(team_raw) if team_raw else None,
+        "version": str(record.get("version", "0.0")),
+        "accepted": int(record.get("accepted", 0)),
+    }
+
+
+def save_state(context: Context, state: dict[str, Any]) -> None:
+    """Persist contracts (never raw texts) for the next run in the series."""
+    context.state.config_records[STATE_KEY] = ConfigRecord(
+        {
+            "voices": [json.dumps(v, ensure_ascii=False) for v in state["voices"]],
+            "team": json.dumps(state["team"], ensure_ascii=False) if state["team"] else "",
+            "version": state["version"],
+            "accepted": state["accepted"],
+        }
+    )
+
+
+def bump(version: str, minor: bool) -> str:
+    major, _, rest = version.partition(".")
+    if minor:
+        return f"{int(major)}.{int(rest or 0) + 1}"
+    return f"{int(major) + 1}.0"
+
+
+# ---------------------------------------------------------------- helpers --
+
+
+def cfg(context: Context, key: str, default: Any = None) -> Any:
     value = context.run_config.get(key, default)
     if value is None:
         raise ValueError(f"{key} must be set in the run config")
     return value
 
 
-def _ask(client: OpenAI, agent: AgentSession, model: str, stage: str, prompt: str) -> str:
-    """One streamed model call; every event is republished to the frontend."""
+def say(agent: AgentSession, text: str) -> None:
+    """Write our own markdown into the chat transcript."""
+    agent.events.emit({"type": "response.output_text.delta", "delta": text})
+
+
+def ask(
+    client: OpenAI,
+    agent: AgentSession,
+    model: str,
+    stage: str,
+    prompt: str,
+    *,
+    show: bool,
+) -> str:
+    """One streamed model call. `show` streams the text into the chat."""
     agent.events.emit({"type": "brand_dna.stage", "stage": stage, "model": model})
     stream = client.responses.create(model=model, input=prompt, stream=True)
     chunks: list[str] = []
     for event in stream:
-        agent.events.emit(event.to_dict())
         if event.type in {"error", "response.failed"}:
             raise RuntimeError(f"Model response failed in {stage}: {event}")
         if event.type == "response.output_text.delta":
             chunks.append(event.delta)
+            if show:
+                agent.events.emit(event.to_dict())
     return "".join(chunks).strip()
 
 
-def _json_block(text: str) -> dict:
-    """Extract the first JSON object from a model answer (tolerates code fences)."""
+def json_block(text: str) -> dict[str, Any]:
     match = re.search(r"\{.*\}", text, flags=re.S)
     if not match:
         raise ValueError(f"No JSON object in model output: {text[:200]}")
     return json.loads(match.group(0))
 
 
+def fetch_text(
+    client: OpenAI, agent: AgentSession, model: str, url: str, max_turns: int
+) -> str:
+    """Read a public page through Flower's web_fetch connector (bounded loop)."""
+    tools = agent.connectors.tools(["web_fetch"])
+    allowed = {t["name"] for t in tools if isinstance(t.get("name"), str)}
+    items: list[dict[str, Any]] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": (
+                f"Fetch {url} and return only the author's own prose from that page "
+                "as plain text. Drop navigation, boilerplate, comments by others."
+            ),
+        }
+    ]
+    for _ in range(max_turns):
+        response = client.responses.create(
+            model=model, input=items, tools=tools, tool_choice="auto"
+        )
+        output = [item.to_dict() for item in response.output]
+        calls = [i for i in output if i.get("type") == "function_call"]
+        if not calls:
+            break
+        outputs = []
+        for call in calls:
+            if call.get("name") not in allowed:
+                outputs.append(
+                    {"type": "function_call_output", "call_id": call["call_id"],
+                     "output": json.dumps({"error": "tool not exposed"})}
+                )
+                continue
+            try:
+                outputs.append(agent.connectors.call(call))
+            except (RuntimeError, ValueError) as exc:
+                outputs.append(
+                    {"type": "function_call_output", "call_id": call["call_id"],
+                     "output": json.dumps({"error": str(exc)})}
+                )
+        items.extend(output)
+        items.extend(outputs)
+    final = client.responses.create(
+        model=model,
+        input=items,
+        instructions="Return only the author's prose from the fetched page as plain text.",
+    )
+    return final.output_text.strip()
+
+
+# ---------------------------------------------------------------- stages ---
+
+
+def distill_voice(client: OpenAI, agent: AgentSession, model: str, name: str, text: str) -> dict:
+    raw = ask(
+        client, agent, model, "reader",
+        "You are a voice analyst. Read the author's own text below and distill a "
+        "Voice Contract: a compact, machine-readable description of how this person "
+        "writes. Describe only what the text shows, invent nothing. Answer with one "
+        f"JSON object exactly in this shape:\n{json.dumps(CONTRACT_SCHEMA, ensure_ascii=False, indent=2)}\n\n"
+        f"AUTHOR: {name}\nTEXT:\n{text}",
+        show=False,
+    )
+    contract = json_block(raw)
+    return {"name": name, "contract": contract, "words": len(text.split())}
+
+
+def merge_team(client: OpenAI, agent: AgentSession, model: str, voices: list[dict]) -> dict:
+    if len(voices) == 1:
+        team = dict(voices[0]["contract"])
+        team["members"] = [voices[0]["name"]]
+        team["individual_notes"] = {}
+        return team
+    raw = ask(
+        client, agent, model, "team",
+        "You are a voice analyst for a team. Below are Voice Contracts of several team "
+        "members. Derive ONE Team Contract in the same JSON shape that captures what "
+        "they share, so that any member can write for the team and it still sounds like "
+        "the team. Add a field \"individual_notes\": an object mapping member name to one "
+        "sentence with that person's distinctive deviation. Add \"members\": list of names. "
+        "Use only what the contracts contain, invent nothing. Answer with one JSON object.\n\n"
+        f"SHAPE:\n{json.dumps(CONTRACT_SCHEMA, ensure_ascii=False, indent=2)}\n\n"
+        + "\n\n".join(
+            f"MEMBER {v['name']}:\n{json.dumps(v['contract'], ensure_ascii=False)}" for v in voices
+        ),
+        show=False,
+    )
+    team = json_block(raw)
+    team.setdefault("members", [v["name"] for v in voices])
+    return team
+
+
+def write_and_check(
+    client: OpenAI, agent: AgentSession, model: str, escalation_model: str,
+    threshold: float, team: dict, version: str, task: str,
+) -> dict:
+    contract_json = json.dumps(team, ensure_ascii=False, indent=2)
+
+    say(agent, "### Generic model (no contract)\n\n")
+    baseline = ask(client, agent, model, "baseline", task, show=True)
+
+    attempts: list[dict] = []
+    for attempt, gen_model in enumerate((model, escalation_model), start=1):
+        label = "Brand-DNA Agent" if attempt == 1 else f"Brand-DNA Agent · escalated to `{gen_model}`"
+        say(agent, f"\n\n### {label} · Team Contract v{version}\n\n")
+        draft = ask(
+            client, agent, gen_model, f"generator-{attempt}",
+            "Write the following task strictly in the team's voice as defined by the "
+            "Team Contract. Respect every taboo. Use the contract's language. Output only "
+            f"the text, no preamble.\n\nTEAM CONTRACT:\n{contract_json}\n\nTASK:\n{task}",
+            show=True,
+        )
+        verdict_raw = ask(
+            client, agent, model, f"critic-{attempt}",
+            "You are a strict critic. Score how well the DRAFT follows the TEAM CONTRACT "
+            "from 0.0 (generic model voice) to 1.0 (indistinguishable from the team). "
+            "Punish every taboo violation and every generic phrase. Answer with one JSON "
+            'object: {"score": <number>, "violations": [<short strings>], "verdict": "<one sentence>"}'
+            f"\n\nTEAM CONTRACT:\n{contract_json}\n\nDRAFT:\n{draft}",
+            show=False,
+        )
+        verdict = json_block(verdict_raw)
+        score = float(verdict.get("score", 0.0))
+        attempts.append({"model": gen_model, "score": score, "verdict": verdict, "text": draft})
+        agent.events.emit({"type": "brand_dna.critic", "attempt": attempt, "model": gen_model, "score": score})
+        say(agent, f"\n\n**Critic:** {score:.2f} / threshold {threshold:.2f} · {verdict.get('verdict', '')}\n")
+        if score >= threshold or gen_model == escalation_model:
+            break
+        agent.events.emit({"type": "brand_dna.escalation", "from": model, "to": escalation_model, "score": score})
+        say(agent, f"\n_Below threshold. Escalating to `{escalation_model}`._\n")
+
+    best = max(attempts, key=lambda a: a["score"])
+    violations = best["verdict"].get("violations", [])
+    if violations:
+        say(agent, "\n**Remaining violations:** " + "; ".join(map(str, violations)) + "\n")
+    return {
+        "baseline": baseline,
+        "text": best["text"],
+        "score": best["score"],
+        "passed": best["score"] >= threshold,
+        "escalated": len(attempts) > 1,
+        "violations": violations,
+    }
+
+
+# ---------------------------------------------------------------- main -----
+
+
+HELP = (
+    "## Brand-DNA Agent · Team Voice\n\n"
+    "One team, one voice, every text checked.\n\n"
+    "- `add-voice <name>: <text or public URL>` distills that person's voice and updates the Team Contract\n"
+    "- `write: <task>` writes under the Team Contract; a critic scores it before you see it\n"
+    "- `show` prints the current Team Contract, members and version\n\n"
+    "Start with `add-voice` for each team member, then `write:`.\n"
+)
+
+
+def parse_command(prompt: str, has_team: bool) -> tuple[str, str, str]:
+    """Return (command, name, payload)."""
+    text = prompt.strip()
+    low = text.lower()
+    if low in {"help", "?"}:
+        return "help", "", ""
+    if low in {"show", "status", "contract"}:
+        return "show", "", ""
+    m = re.match(r"^add[- _]?voice\s+([^:]+?)\s*:\s*(.+)$", text, flags=re.S | re.I)
+    if m:
+        return "add-voice", m.group(1).strip(), m.group(2).strip()
+    m = re.match(r"^write\s*:\s*(.+)$", text, flags=re.S | re.I)
+    if m:
+        return "write", "", m.group(1).strip()
+    if has_team:
+        return "write", "", text
+    return "help", "", ""
+
+
 @app.main()
 def main(agent: AgentSession, context: Context) -> None:
-    model = str(_cfg(context, "agent.model")).strip()
-    escalation_model = str(_cfg(context, "agent.escalation-model", model)).strip()
-    threshold = float(_cfg(context, "agent.threshold", 0.8))
-    task = str(_cfg(context, "agent.task")).strip()
-    samples = [
-        str(_cfg(context, f"agent.sample-{i}")).strip() for i in (1, 2, 3)
-    ]
-    samples = [s for s in samples if s]
-    if len(samples) < 1:
-        raise ValueError("agent.sample-1 … agent.sample-3 must hold at least one text")
+    try:
+        _main(agent, context)
+    except Exception as exc:  # surface the failure in the chat, then fail the run
+        say(agent, f"\n\n**Run failed:** {exc}\n")
+        raise
+
+
+def _main(agent: AgentSession, context: Context) -> None:
+    prompt = str(cfg(context, "agent.input")).strip()
+    model = str(cfg(context, "agent.model")).strip()
+    escalation_model = str(cfg(context, "agent.escalation-model", model)).strip()
+    threshold = float(cfg(context, "agent.threshold", 0.8))
+    max_turns = int(cfg(context, "agent.max-tool-turns", 2))
+    if not 0 <= max_turns <= MAX_TOOL_TURNS_LIMIT:
+        raise ValueError(f"agent.max-tool-turns must be between 0 and {MAX_TOOL_TURNS_LIMIT}")
+
+    state = load_state(context)
+    command, name, payload = parse_command(prompt, state["team"] is not None)
 
     client = OpenAI(
         base_url=os.environ["FLWR_RUNTIME_BASE_URL"],
@@ -81,73 +332,79 @@ def main(agent: AgentSession, context: Context) -> None:
         max_retries=0,
     )
 
-    # 02 EXTRACTOR + 03 READER: samples -> Voice Contract (gate 1)
-    joined = "\n\n---\n\n".join(f"SAMPLE {i+1}:\n{s}" for i, s in enumerate(samples))
-    contract_raw = _ask(
-        client, agent, model, "reader",
-        "You are a voice analyst. Read the author's own texts below and distill a "
-        "Voice Contract: a compact, machine-readable description of how this person "
-        "writes. Describe only what the samples show, invent nothing. Answer with one "
-        f"JSON object exactly in this shape:\n{json.dumps(CONTRACT_SCHEMA, ensure_ascii=False, indent=2)}\n\n"
-        f"{joined}",
+    if command == "help":
+        say(agent, HELP)
+        if state["team"] is not None:
+            say(agent, f"\nTeam Contract v{state['version']} exists with {len(state['voices'])} member(s).\n")
+        print(HELP)
+        return
+
+    if command == "show":
+        if state["team"] is None:
+            say(agent, "No Team Contract yet. Add a voice first: `add-voice <name>: <text>`\n")
+            return
+        members = ", ".join(v["name"] for v in state["voices"])
+        out = (
+            f"## Team Contract v{state['version']}\n\n"
+            f"**Members:** {members} · **Accepted texts:** {state['accepted']}\n\n"
+            f"```json\n{json.dumps(state['team'], ensure_ascii=False, indent=2)}\n```\n"
+        )
+        say(agent, out)
+        print(out)
+        return
+
+    if command == "add-voice":
+        source = "url" if URL_RE.match(payload) else "text"
+        if source == "url":
+            say(agent, f"Reading {payload} through `web_fetch` …\n\n")
+            try:
+                text = fetch_text(client, agent, model, payload, max_turns)
+            except Exception as exc:  # connector unavailable in this runtime
+                say(agent, f"Could not read the URL here ({exc}). Paste the text instead.\n")
+                return
+        else:
+            text = payload
+        if len(text.split()) < 15:
+            say(agent, "That is too little text to read a voice from. Give me at least a few sentences.\n")
+            return
+
+        say(agent, f"Distilling **{name}**'s voice from {len(text.split())} words …\n\n")
+        voice = distill_voice(client, agent, model, name, text)
+        voice["source"] = source
+        state["voices"] = [v for v in state["voices"] if v["name"].lower() != name.lower()] + [voice]
+        state["team"] = merge_team(client, agent, model, state["voices"])
+        state["version"] = bump(state["version"], minor=state["version"] != "0.0")
+        save_state(context, state)
+        agent.events.emit({"type": "brand_dna.contract", "version": state["version"], "members": [v["name"] for v in state["voices"]]})
+
+        c = voice["contract"]
+        out = (
+            f"### Voice of {name}\n\n"
+            f"- **Tone:** {c.get('tone', '')}\n"
+            f"- **Rhythm:** {c.get('sentence_rhythm', '')}\n"
+            f"- **Taboos:** {', '.join(map(str, c.get('taboos', []))) or 'none found'}\n\n"
+            f"### Team Contract → v{state['version']}\n\n"
+            f"**Members:** {', '.join(v['name'] for v in state['voices'])}\n\n"
+            f"```json\n{json.dumps(state['team'], ensure_ascii=False, indent=2)}\n```\n"
+            "_Stored: the contract. Discarded: the original text._\n"
+        )
+        say(agent, out)
+        print(out)
+        return
+
+    # command == "write"
+    if state["team"] is None:
+        say(agent, "No Team Contract yet. Add a voice first: `add-voice <name>: <text>`\n")
+        return
+    result = write_and_check(
+        client, agent, model, escalation_model, threshold, state["team"], state["version"], payload
     )
-    contract = _json_block(contract_raw)
-    contract["version"] = "1.0"
-    contract["source"] = {"samples": len(samples), "words": sum(len(s.split()) for s in samples)}
-    agent.events.emit({"type": "brand_dna.contract", "contract": contract})
-
-    # Baseline for the split-screen: the same task without any contract.
-    baseline = _ask(client, agent, model, "baseline", task)
-
-    # 04 GENERATOR + 05 CRITIC with escalation (gate 2)
-    contract_json = json.dumps(contract, ensure_ascii=False, indent=2)
-    attempts = []
-    for attempt, gen_model in enumerate((model, escalation_model), start=1):
-        draft = _ask(
-            client, agent, gen_model, f"generator-{attempt}",
-            "Write the following task strictly in the author's voice as defined by the "
-            "Voice Contract. Respect every taboo. Use the contract's language. Output "
-            f"only the text, no preamble.\n\nVOICE CONTRACT:\n{contract_json}\n\nTASK:\n{task}",
-        )
-        critic_raw = _ask(
-            client, agent, model, f"critic-{attempt}",
-            "You are a strict critic. Score how well the DRAFT follows the VOICE CONTRACT "
-            "on a scale from 0.0 (generic model voice) to 1.0 (indistinguishable from the "
-            "author). Punish every taboo violation and every generic phrase. Answer with "
-            'one JSON object: {"score": <number>, "violations": [<short strings>], '
-            '"verdict": "<one sentence>"}\n\n'
-            f"VOICE CONTRACT:\n{contract_json}\n\nDRAFT:\n{draft}",
-        )
-        verdict = _json_block(critic_raw)
-        score = float(verdict.get("score", 0.0))
-        attempts.append({"model": gen_model, "score": score, "verdict": verdict, "text": draft})
-        agent.events.emit({"type": "brand_dna.critic", "attempt": attempt, "model": gen_model, "score": score})
-        if score >= threshold:
-            break
-        if gen_model == escalation_model:
-            break  # escalation already used, ship best effort but flag it
-        agent.events.emit({"type": "brand_dna.escalation", "from": model, "to": escalation_model, "score": score})
-
-    best = max(attempts, key=lambda a: a["score"])
-    result = {
-        "contract_version": contract["version"],
-        "threshold": threshold,
-        "passed": best["score"] >= threshold,
-        "escalated": len(attempts) > 1,
-        "baseline": baseline,
-        "agent": best["text"],
-        "score": best["score"],
-        "violations": best["verdict"].get("violations", []),
-        "attempts": [{"model": a["model"], "score": a["score"]} for a in attempts],
-    }
-    agent.events.emit({"type": "brand_dna.result", **result})
-
-    print("=== VOICE CONTRACT v" + contract["version"] + " ===")
-    print(contract_json)
-    print("\n=== GENERIC MODEL (no contract) ===")
-    print(baseline)
-    print(f"\n=== BRAND-DNA AGENT · score {best['score']:.2f} / threshold {threshold:.2f}"
-          f"{' · escalated' if result['escalated'] else ''} ===")
-    print(best["text"])
-    if result["violations"]:
-        print("\nremaining violations: " + "; ".join(map(str, result["violations"])))
+    if result["passed"]:
+        state["accepted"] += 1
+        state["version"] = bump(state["version"], minor=True)
+        save_state(context, state)
+        say(agent, f"\n_Accepted. Team Contract → v{state['version']}._\n")
+    else:
+        say(agent, "\n_Not accepted: below threshold even after escalation. Nothing ships unscored._\n")
+    agent.events.emit({"type": "brand_dna.result", "version": state["version"], **{k: v for k, v in result.items() if k != "baseline"}})
+    print(json.dumps({"score": result["score"], "passed": result["passed"], "escalated": result["escalated"], "version": state["version"]}))
