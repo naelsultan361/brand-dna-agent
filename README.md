@@ -88,14 +88,17 @@ a SuperGrid login. It needs `[superlink.local-agent]` in `~/.flwr/config.toml`
 - **No invention.** Contracts are distilled only from texts the user supplies or
   from a URL the user names. The prompts forbid inventing traits; the critic
   punishes generic phrases and taboo violations.
-- **Contracts, not texts.** The conversation state stores the contracts. The
-  original texts are discarded after extraction and never written to state or
-  logs.
+- **Contracts, not texts, in our record.** The agent's own state (`team_voice`)
+  stores derived contracts only. Flower itself keeps the conversation, so a
+  pasted text is visible to everyone in that conversation; treat it as shared
+  with the team.
 - **Fail closed.** A text below the threshold is not accepted, even after the
   second attempt, and the user is told why.
-- **Bounded loops.** At most one second attempt per task; the `web_fetch` loop
-  is capped by `max-tool-turns` (hard limit 5); only the requested tool may be
-  called.
+- **Bounded, deterministic tool use.** At most one second attempt per task. A
+  URL sample triggers exactly one `web_fetch` of the URL the user named; the
+  page content is passed to the model as data and cannot trigger further
+  fetches. Role instructions live in the system prompt; samples, contracts and
+  drafts are treated as untrusted data.
 - **No credentials in the app.** Flower's runtime injects the model endpoint and
   token; the project holds no API keys.
 
